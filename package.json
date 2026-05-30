@@ -1,0 +1,20 @@
+{
+  "name": "exogator-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for wallet connect, short URLs, website deployment, APK hosting, custom domains",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "adm-zip": "^0.5.12",
+    "@aws-sdk/client-s3": "^3.588.0",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Exogator",
+  "license": "MIT"
+}
