@@ -1,7 +1,19 @@
-"dependencies": {
-  "@aws-sdk/client-s3": "^3.0.0",
-  "adm-zip": "^0.5.10",
-  "express": "^4.18.2",
-  "qrcode": "^1.5.3",
-  "telegraf": "^4.12.2"
+{
+  "name": "exogator-bot",
+  "version": "2.0.0",
+  "description": "Telegram bot for URL shortener, website deploy, APK hosting, wallet connect",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "adm-zip": "^0.5.10",
+    "express": "^4.18.2",
+    "qrcode": "^1.5.3",
+    "telegraf": "^4.12.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
