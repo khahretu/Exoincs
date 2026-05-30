@@ -1,57 +1,46 @@
-// bot.js - Exogator Universal Bot
 const { Telegraf, Markup } = require('telegraf');
 const AdmZip = require('adm-zip');
-const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 
-// ========== CONFIGURATION (Environment Variables) ==========
+// ========== ENVIRONMENT VARIABLES ==========
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
 const R2_ACCESS_KEY = process.env.R2_ACCESS_KEY;
 const R2_SECRET_KEY = process.env.R2_SECRET_KEY;
 const R2_BUCKET = process.env.R2_BUCKET || 'exoincs';
 const CF_API_TOKEN = process.env.CF_API_TOKEN;
-const CF_ZONE_ID = process.env.CF_ZONE_ID;          // Zone for custom domains (must be managed by Cloudflare)
+const CF_ZONE_ID = process.env.CF_ZONE_ID;
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
-const CF_KV_NAMESPACE_ID = process.env.CF_KV_NAMESPACE_ID; // KV namespace ID (for short links, domain mapping)
-const WORKER_SHORT_URL = process.env.WORKER_SHORT_URL || 'https://short.exogator.workers.dev'; // Worker for short links
-const WORKER_DEPLOY_URL = process.env.WORKER_DEPLOY_URL || 'https://deploy.exogator.workers.dev'; // Worker for serving sites & APKs
+const CF_KV_NAMESPACE_ID = process.env.CF_KV_NAMESPACE_ID;
+const WORKER_SHORT_URL = process.env.WORKER_SHORT_URL || 'https://short.exogator.workers.dev';
+const WORKER_DEPLOY_URL = process.env.WORKER_DEPLOY_URL || 'https://deploy.exogator.workers.dev';
 
 const TEMP_DIR = '/tmp/exogator_bot';
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-// Initialize R2 client (S3 compatible)
+// R2 client
 const s3 = new S3Client({
     region: 'auto',
     endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
     credentials: { accessKeyId: R2_ACCESS_KEY, secretAccessKey: R2_SECRET_KEY },
 });
 
-// Helper: upload buffer to R2
+// ---------- Helper: R2 operations ----------
 async function uploadToR2(key, buffer, contentType) {
-    const command = new PutObjectCommand({
-        Bucket: R2_BUCKET,
-        Key: key,
-        Body: buffer,
-        ContentType: contentType,
-    });
-    await s3.send(command);
+    await s3.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: buffer, ContentType: contentType }));
 }
-
-// Helper: get file from R2
 async function getFromR2(key) {
-    const command = new GetObjectCommand({ Bucket: R2_BUCKET, Key: key });
-    const response = await s3.send(command);
-    const stream = response.Body;
+    const obj = await s3.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
     const chunks = [];
-    for await (const chunk of stream) chunks.push(chunk);
+    for await (const chunk of obj.Body) chunks.push(chunk);
     return Buffer.concat(chunks);
 }
 
-// Helper: store JSON in KV (via Cloudflare API)
-async function kvPut(key, value, ttlSeconds = 0) {
+// ---------- Helper: Cloudflare KV API ----------
+async function kvPut(key, value) {
     const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}`;
     const res = await fetch(url, {
         method: 'PUT',
@@ -60,7 +49,6 @@ async function kvPut(key, value, ttlSeconds = 0) {
     });
     if (!res.ok) throw new Error(`KV put failed: ${await res.text()}`);
 }
-
 async function kvGet(key) {
     const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}`;
     const res = await fetch(url, { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } });
@@ -69,8 +57,13 @@ async function kvGet(key) {
     const text = await res.text();
     try { return JSON.parse(text); } catch(e) { return text; }
 }
+async function kvDelete(key) {
+    const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}`;
+    const res = await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } });
+    if (!res.ok && res.status !== 404) throw new Error(`KV delete failed: ${await res.text()}`);
+}
 
-// Helper: add CNAME record via Cloudflare API
+// ---------- Helper: DNS (CNAME) ----------
 async function addCNAME(domain, target) {
     const url = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records`;
     const res = await fetch(url, {
@@ -81,12 +74,10 @@ async function addCNAME(domain, target) {
     const data = await res.json();
     if (!data.success) throw new Error(`DNS error: ${JSON.stringify(data.errors)}`);
 }
-
 async function deleteCNAME(domain) {
-    // First get record id
     const listUrl = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${domain}`;
-    const listRes = await fetch(listUrl, { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } });
-    const listData = await listRes.json();
+    const list = await fetch(listUrl, { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } });
+    const listData = await list.json();
     const record = listData.result.find(r => r.name === domain);
     if (!record) throw new Error('Record not found');
     const delUrl = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record.id}`;
@@ -95,11 +86,18 @@ async function deleteCNAME(domain) {
     if (!delData.success) throw new Error('Delete failed');
 }
 
-// ---------- BOT COMMANDS ----------
+// ---------- Bot Initialization ----------
 const bot = new Telegraf(BOT_TOKEN);
+
+// Session middleware (simple memory store)
+bot.use(async (ctx, next) => {
+    if (!ctx.session) ctx.session = {};
+    return next();
+});
 
 // Main menu
 bot.start(async (ctx) => {
+    ctx.session = {};
     await ctx.reply('🚀 *Exogator Bot* – All-in-one crypto tool\n\nChoose an option:', {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
@@ -113,71 +111,233 @@ bot.start(async (ctx) => {
     });
 });
 
-// Wallet connect demo
+// ==================== WALLET CONNECT (with config) ====================
 bot.action('menu_wallet', async (ctx) => {
-    const demoUrl = `${WORKER_DEPLOY_URL}/wallet-demo/index.html`; // You need to host a demo page
-    await ctx.reply(`🔌 *Wallet Connect Demo*\n\nUse this URL to test wallet connection (your wallet SDK):\n${demoUrl}\n\nYou can also send me a ZIP of your site and I will inject the wallet code.`, { parse_mode: 'Markdown' });
+    ctx.session.walletConfig = { theme: 2, exogatorId: '', towsteps: 1, auto: 1 };
+    await ctx.reply('⚙️ *Wallet Connect Configuration*\nSelect Modal Theme:', {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('1️⃣ Light', 'wallet_theme_1')],
+            [Markup.button.callback('2️⃣ Dark', 'wallet_theme_2')],
+            [Markup.button.callback('3️⃣ Neon', 'wallet_theme_3')],
+            [Markup.button.callback('4️⃣ Classic', 'wallet_theme_4')],
+            [Markup.button.callback('🔙 Back', 'start_menu')]
+        ])
+    });
 });
-
-// Short URL: user sends long URL after this command
-bot.action('menu_short', async (ctx) => {
-    await ctx.reply('✂️ *Create Short URL*\n\nSend me a long URL (starting with http:// or https://).', { parse_mode: 'Markdown' });
-    ctx.session = { expecting: 'short_url' };
+bot.action(/wallet_theme_(\d)/, async (ctx) => {
+    const theme = parseInt(ctx.match[1]);
+    ctx.session.walletConfig.theme = theme;
+    await ctx.reply(`✅ Theme set to ${theme}\n\nNow send me your *Exogator ID* (or type /skip to use default).`, { parse_mode: 'Markdown' });
+    ctx.session.expecting = 'wallet_exoid';
 });
-
-// Deploy website: user sends zip
-bot.action('menu_deploy', async (ctx) => {
-    await ctx.reply('📦 *Deploy Website*\n\nSend me a ZIP file containing your website (must have index.html). I will deploy it and give you a short URL.', { parse_mode: 'Markdown' });
-    ctx.session = { expecting: 'deploy_zip' };
-});
-
-// APK hosting
-bot.action('menu_apk', async (ctx) => {
-    await ctx.reply('📱 *APK Hosting*\n\nSend me an APK file. I will give you a download link with tracking.', { parse_mode: 'Markdown' });
-    ctx.session = { expecting: 'apk_file' };
-});
-
-// Custom domain management (submenu)
-bot.action('menu_domain', async (ctx) => {
-    await ctx.reply('🌐 *Custom Domains*\n\nChoose action:', Markup.inlineKeyboard([
-        [Markup.button.callback('➕ Add domain', 'domain_add')],
-        [Markup.button.callback('❌ Delete domain', 'domain_del')],
-        [Markup.button.callback('✏️ Edit domain', 'domain_edit')],
-        [Markup.button.callback('📋 List domains', 'domain_list')],
-        [Markup.button.callback('🔙 Back', 'start_menu')],
-    ]));
-});
-
-// Stats submenu
-bot.action('menu_stats', async (ctx) => {
-    await ctx.reply('📊 *Stats*\n\nSend a short code or APK ID to get stats.\nExample: `/stats abc123`', { parse_mode: 'Markdown' });
-});
-
-// ========== HANDLING MESSAGES ==========
 bot.on('text', async (ctx) => {
-    const expecting = ctx.session?.expecting;
-    if (expecting === 'short_url') {
+    if (ctx.session.expecting === 'wallet_exoid') {
+        let exoId = ctx.message.text.trim();
+        if (exoId === '/skip') exoId = `user_${ctx.from.id}`;
+        ctx.session.walletConfig.exogatorId = exoId;
+        ctx.session.expecting = null;
+        await ctx.reply(`✅ Exogator ID: \`${exoId}\`\n\nTwo‑step mode?`, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Enabled', 'wallet_towsteps_1')],
+                [Markup.button.callback('❌ Disabled', 'wallet_towsteps_0')],
+            ])
+        });
+    } else if (ctx.session.expecting === 'short_url_long') {
         const longUrl = ctx.message.text;
-        if (!longUrl.match(/^https?:\/\//)) return ctx.reply('❌ Invalid URL. Must start with http:// or https://');
+        if (!/^https?:\/\//.test(longUrl)) return ctx.reply('❌ Invalid URL. Must start with http:// or https://');
         const shortCode = Math.random().toString(36).substring(2, 8);
         await kvPut(`short:${shortCode}`, longUrl);
         await kvPut(`views:${shortCode}`, 0);
         const shortUrl = `${WORKER_SHORT_URL}/${shortCode}`;
         await ctx.reply(`✅ Short URL created:\n${shortUrl}\n\nUse /stats ${shortCode} to see clicks.`);
-        delete ctx.session.expecting;
+        ctx.session.expecting = null;
+        // Return to short submenu
+        await ctx.reply('🔗 *Short URL Manager*', { parse_mode: 'Markdown', ...shortUrlKeyboard() });
+    } else if (ctx.session.expecting === 'domain_add') {
+        const parts = ctx.message.text.split(' ');
+        if (parts.length !== 2) return ctx.reply('Send as: `shortcode domain.com`', { parse_mode: 'Markdown' });
+        const [shortCode, domain] = parts;
+        const deploy = await kvGet(`deploy:${shortCode}`);
+        const short = await kvGet(`short:${shortCode}`);
+        if (!deploy && !short) return ctx.reply('Short code not found.');
+        const target = deploy ? WORKER_DEPLOY_URL.replace('https://', '') : WORKER_SHORT_URL.replace('https://', '');
+        try {
+            await addCNAME(domain, target);
+            await kvPut(`domain:${domain}`, { type: deploy ? 'deploy' : 'short', shortCode });
+            await ctx.reply(`✅ Domain ${domain} mapped to ${shortCode}.`);
+        } catch(e) { ctx.reply(`❌ Error: ${e.message}`); }
+        ctx.session.expecting = null;
+        await ctx.reply('🌐 *Custom Domains*', { parse_mode: 'Markdown', ...domainKeyboard() });
+    } else if (ctx.session.expecting === 'domain_del') {
+        const domain = ctx.message.text.trim();
+        try {
+            await deleteCNAME(domain);
+            await kvDelete(`domain:${domain}`);
+            await ctx.reply(`✅ Domain ${domain} removed.`);
+        } catch(e) { ctx.reply(`❌ Error: ${e.message}`); }
+        ctx.session.expecting = null;
+        await ctx.reply('🌐 *Custom Domains*', { parse_mode: 'Markdown', ...domainKeyboard() });
     } else {
-        await ctx.reply('Please use the buttons to choose an action.', Markup.inlineKeyboard([Markup.button.callback('🔙 Main menu', 'start_menu')]));
+        // fallback
+        await ctx.reply('Please use the menu buttons.', Markup.inlineKeyboard([Markup.button.callback('🔙 Main menu', 'start_menu')]));
     }
 });
+bot.action(/wallet_towsteps_(\d)/, async (ctx) => {
+    const towsteps = parseInt(ctx.match[1]);
+    ctx.session.walletConfig.towsteps = towsteps;
+    await ctx.reply(towsteps ? '✅ Two-step enabled' : '❌ Two-step disabled');
+    await ctx.reply('Auto‑connect on page load?', Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Yes', 'wallet_auto_1')],
+        [Markup.button.callback('❌ No', 'wallet_auto_0')],
+    ]));
+});
+bot.action(/wallet_auto_(\d)/, async (ctx) => {
+    const auto = parseInt(ctx.match[1]);
+    ctx.session.walletConfig.auto = auto;
+    const cfg = ctx.session.walletConfig;
+    const demoUrl = `${WORKER_DEPLOY_URL}/wallet-demo?theme=${cfg.theme}&exo=${cfg.exogatorId}&towsteps=${cfg.towsteps}&auto=${cfg.auto}`;
+    await ctx.reply(`✅ Configuration saved!\n\n🔗 *Demo Link:*\n${demoUrl}\n\nYou can also send me a ZIP and I will inject these settings.`, { parse_mode: 'Markdown' });
+    await ctx.reply('🔌 *Wallet Connect*', { parse_mode: 'Markdown', ...walletKeyboard() });
+});
 
+// ==================== SHORT URL SUBMENU ====================
+function shortUrlKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Create New', 'short_create')],
+        [Markup.button.callback('📊 Stats', 'short_stats')],
+        [Markup.button.callback('📋 My Links', 'short_mylinks')],
+        [Markup.button.callback('🌐 Custom Domain', 'short_domain')],
+        [Markup.button.callback('🔙 Back', 'start_menu')],
+    ]);
+}
+bot.action('menu_short', async (ctx) => {
+    await ctx.reply('🔗 *Short URL Manager*', { parse_mode: 'Markdown', ...shortUrlKeyboard() });
+});
+bot.action('short_create', async (ctx) => {
+    await ctx.reply('Send me a long URL (starting with http:// or https://):');
+    ctx.session.expecting = 'short_url_long';
+});
+bot.action('short_stats', async (ctx) => {
+    await ctx.reply('Send the short code (e.g., `abc123`) to see stats:', { parse_mode: 'Markdown' });
+    ctx.session.expecting = 'short_stats_code';
+});
+bot.action('short_mylinks', async (ctx) => {
+    // In a real implementation, you would query KV for keys with prefix `short:user_${ctx.from.id}`
+    await ctx.reply('🔧 Feature in development. You can use /stats <code> for now.');
+});
+bot.action('short_domain', async (ctx) => {
+    await ctx.reply('To map a custom domain to a short URL, use:\n`/domain add <shortcode> yourdomain.com`\n\nMake sure your domain is on Cloudflare.', { parse_mode: 'Markdown' });
+    await ctx.reply('🌐 *Custom Domains*', { parse_mode: 'Markdown', ...domainKeyboard() });
+});
+
+// ==================== DEPLOY WEBSITE SUBMENU ====================
+function deployKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('📤 Upload ZIP', 'deploy_upload')],
+        [Markup.button.callback('📋 My Sites', 'deploy_mysites')],
+        [Markup.button.callback('⚙️ Inject Wallet Settings', 'deploy_inject')],
+        [Markup.button.callback('🔙 Back', 'start_menu')],
+    ]);
+}
+bot.action('menu_deploy', async (ctx) => {
+    await ctx.reply('📦 *Deploy Website*', { parse_mode: 'Markdown', ...deployKeyboard() });
+});
+bot.action('deploy_upload', async (ctx) => {
+    await ctx.reply('Send me a ZIP file of your website (must contain index.html).');
+    ctx.session.expecting = 'deploy_zip';
+});
+bot.action('deploy_inject', async (ctx) => {
+    await ctx.reply('⚙️ You can configure wallet settings first via the Wallet Connect menu, then send me a ZIP – I will inject those settings automatically.');
+    await ctx.reply('Send a ZIP file now:');
+    ctx.session.expecting = 'deploy_zip_with_inject';
+});
+bot.action('deploy_mysites', async (ctx) => {
+    await ctx.reply('🔧 Feature in development. Use `/stats <shortcode>` for now.');
+});
+
+// ==================== APK HOSTING SUBMENU ====================
+function apkKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('📤 Upload APK', 'apk_upload')],
+        [Markup.button.callback('📊 Stats', 'apk_stats')],
+        [Markup.button.callback('📋 My APKs', 'apk_mylist')],
+        [Markup.button.callback('🔙 Back', 'start_menu')],
+    ]);
+}
+bot.action('menu_apk', async (ctx) => {
+    await ctx.reply('📱 *APK Hosting*', { parse_mode: 'Markdown', ...apkKeyboard() });
+});
+bot.action('apk_upload', async (ctx) => {
+    await ctx.reply('Send me an APK file.');
+    ctx.session.expecting = 'apk_file';
+});
+bot.action('apk_stats', async (ctx) => {
+    await ctx.reply('Send the APK ID (e.g., `apk:xyz`) to see stats:', { parse_mode: 'Markdown' });
+    ctx.session.expecting = 'apk_stats';
+});
+bot.action('apk_mylist', async (ctx) => {
+    await ctx.reply('🔧 Feature in development.');
+});
+
+// ==================== CUSTOM DOMAIN SUBMENU ====================
+function domainKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Add Domain', 'domain_add')],
+        [Markup.button.callback('❌ Delete Domain', 'domain_del')],
+        [Markup.button.callback('📋 List Domains', 'domain_list')],
+        [Markup.button.callback('🔙 Back', 'start_menu')],
+    ]);
+}
+bot.action('menu_domain', async (ctx) => {
+    await ctx.reply('🌐 *Custom Domains*', { parse_mode: 'Markdown', ...domainKeyboard() });
+});
+bot.action('domain_add', async (ctx) => {
+    await ctx.reply('Send as: `shortcode domain.com`\nExample: `abc123 mysite.com`');
+    ctx.session.expecting = 'domain_add';
+});
+bot.action('domain_del', async (ctx) => {
+    await ctx.reply('Send the domain to delete (e.g., `mysite.com`):');
+    ctx.session.expecting = 'domain_del';
+});
+bot.action('domain_list', async (ctx) => {
+    // In a real implementation, query KV for keys with prefix "domain:"
+    await ctx.reply('🔧 To list domains, please use the `/domain list` command.');
+});
+
+// ==================== STATS SUBMENU ====================
+function statsKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('🔗 Short URL Stats', 'stats_short')],
+        [Markup.button.callback('📱 APK Stats', 'stats_apk')],
+        [Markup.button.callback('📦 Site Stats', 'stats_site')],
+        [Markup.button.callback('🔙 Back', 'start_menu')],
+    ]);
+}
+bot.action('menu_stats', async (ctx) => {
+    await ctx.reply('📊 *Stats*', { parse_mode: 'Markdown', ...statsKeyboard() });
+});
+bot.action('stats_short', async (ctx) => {
+    await ctx.reply('Send the short code (e.g., `abc123`):');
+    ctx.session.expecting = 'short_stats_code';
+});
+bot.action('stats_apk', async (ctx) => {
+    await ctx.reply('Send the APK ID (e.g., `apk:xyz`):');
+    ctx.session.expecting = 'apk_stats';
+});
+bot.action('stats_site', async (ctx) => {
+    await ctx.reply('Send the site short code (e.g., `abc123`):');
+    ctx.session.expecting = 'site_stats';
+});
+
+// ==================== FILE HANDLERS ====================
 bot.on('document', async (ctx) => {
-    const expecting = ctx.session?.expecting;
-    if (expecting === 'deploy_zip') {
+    const expecting = ctx.session.expecting;
+    if (expecting === 'deploy_zip' || expecting === 'deploy_zip_with_inject') {
         const doc = ctx.message.document;
         if (!doc.file_name.endsWith('.zip')) return ctx.reply('❌ Please send a .zip file.');
         await ctx.reply('⏳ Processing ZIP...');
-
-        // Download zip
         const fileLink = await ctx.telegram.getFileLink(doc.file_id);
         const resp = await fetch(fileLink.href);
         const buffer = await resp.arrayBuffer();
@@ -185,119 +345,52 @@ bot.on('document', async (ctx) => {
         fs.writeFileSync(zipPath, Buffer.from(buffer));
 
         let zip;
-        try {
-            zip = new AdmZip(zipPath);
-        } catch(e) { return ctx.reply('Invalid ZIP'); }
+        try { zip = new AdmZip(zipPath); } catch(e) { return ctx.reply('Invalid ZIP'); }
         const entries = zip.getEntries();
         let hasIndex = false;
         for (const e of entries) if (e.entryName === 'index.html') { hasIndex = true; break; }
         if (!hasIndex) return ctx.reply('ZIP must contain index.html at root.');
 
-        // Generate short code
         const shortCode = Math.random().toString(36).substring(2, 8);
         const folder = `sites/${shortCode}/`;
-
-        // Upload each file to R2
         let count = 0;
         for (const entry of entries) {
             if (entry.isDirectory) continue;
             const key = folder + entry.entryName;
-            let contentType = 'application/octet-stream';
-            if (entry.entryName.endsWith('.html')) contentType = 'text/html';
-            else if (entry.entryName.endsWith('.css')) contentType = 'text/css';
-            else if (entry.entryName.endsWith('.js')) contentType = 'application/javascript';
-            else if (entry.entryName.endsWith('.png')) contentType = 'image/png';
-            else if (entry.entryName.endsWith('.jpg')) contentType = 'image/jpeg';
-            await uploadToR2(key, entry.getData(), contentType);
+            let ct = 'application/octet-stream';
+            if (entry.entryName.endsWith('.html')) ct = 'text/html';
+            else if (entry.entryName.endsWith('.css')) ct = 'text/css';
+            else if (entry.entryName.endsWith('.js')) ct = 'application/javascript';
+            else if (entry.entryName.endsWith('.png')) ct = 'image/png';
+            else if (entry.entryName.endsWith('.jpg')) ct = 'image/jpeg';
+            await uploadToR2(key, entry.getData(), ct);
             count++;
         }
-
-        // Store mapping
         await kvPut(`deploy:${shortCode}`, { folder, createdAt: new Date().toISOString() });
         const deployUrl = `${WORKER_DEPLOY_URL}/${shortCode}/index.html`;
-        await ctx.reply(`✅ Deployed ${count} files.\nURL: ${deployUrl}\n\nShort code: \`${shortCode}\`\nUse /domain add ${shortCode} yourdomain.com to add custom domain.`, { parse_mode: 'Markdown' });
+        await ctx.reply(`✅ Deployed ${count} files.\nURL: ${deployUrl}\nShort code: \`${shortCode}\``, { parse_mode: 'Markdown' });
         fs.unlinkSync(zipPath);
         delete ctx.session.expecting;
     } else if (expecting === 'apk_file') {
         const doc = ctx.message.document;
         if (!doc.file_name.endsWith('.apk')) return ctx.reply('❌ Please send an .apk file.');
         await ctx.reply('⏳ Uploading APK...');
-
         const fileLink = await ctx.telegram.getFileLink(doc.file_id);
         const resp = await fetch(fileLink.href);
         const buffer = await resp.arrayBuffer();
-        const fileName = doc.file_name;
         const shortId = Math.random().toString(36).substring(2, 10);
         const key = `apks/${shortId}.apk`;
         await uploadToR2(key, Buffer.from(buffer), 'application/vnd.android.package-archive');
-
-        const originalName = fileName;
-        await kvPut(`apk:${shortId}`, { originalName, uploadTime: new Date().toISOString(), downloads: 0 });
+        await kvPut(`apk:${shortId}`, { originalName: doc.file_name, uploadTime: new Date().toISOString(), downloads: 0 });
         const downloadUrl = `${WORKER_DEPLOY_URL}/apk/${shortId}.apk`;
-        await ctx.reply(`✅ APK uploaded.\nDownload link: ${downloadUrl}\nTracking ID: \`${shortId}\`\nUse /stats apk:${shortId} to see downloads.`, { parse_mode: 'Markdown' });
+        await ctx.reply(`✅ APK uploaded.\nDownload link: ${downloadUrl}\nAPK ID: \`${shortId}\``, { parse_mode: 'Markdown' });
         delete ctx.session.expecting;
     } else {
-        await ctx.reply('Please select an option from the menu first.', Markup.inlineKeyboard([Markup.button.callback('🔙 Main menu', 'start_menu')]));
+        await ctx.reply('Please select an option from the menu first.');
     }
 });
 
-// Custom domain subcommands (inline callbacks)
-bot.action('domain_add', async (ctx) => {
-    await ctx.reply('Send domain info as: `shortcode domain.com`\nExample: `/domain abc123 mysite.com`\n\nYou must own the domain and have it on Cloudflare.', { parse_mode: 'Markdown' });
-    ctx.session = { expecting: 'domain_add' };
-});
-
-bot.action('domain_del', async (ctx) => {
-    await ctx.reply('Send domain to delete: `/domain del mysite.com`', { parse_mode: 'Markdown' });
-    ctx.session = { expecting: 'domain_del' };
-});
-
-bot.action('domain_edit', async (ctx) => {
-    await ctx.reply('Send edit info: `/domain edit olddomain.com newdomain.com`', { parse_mode: 'Markdown' });
-    ctx.session = { expecting: 'domain_edit' };
-});
-
-bot.action('domain_list', async (ctx) => {
-    // List all domain mappings from KV (prefix "domain:")
-    // This is complex; for simplicity, just instruct user to use /domain list command
-    await ctx.reply('Use `/domain list` command to list all domains.', { parse_mode: 'Markdown' });
-});
-
-// Handle text commands for domain management
-bot.command('domain', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    const sub = args[1];
-    if (sub === 'add' && args[2] && args[3]) {
-        const shortCode = args[2];
-        const domain = args[3];
-        // Check if shortCode exists (deploy or short)
-        const deploy = await kvGet(`deploy:${shortCode}`);
-        const shortLink = await kvGet(`short:${shortCode}`);
-        if (!deploy && !shortLink) return ctx.reply('Short code not found.');
-        const target = deploy ? WORKER_DEPLOY_URL.replace('https://', '') : WORKER_SHORT_URL.replace('https://', '');
-        try {
-            await addCNAME(domain, target);
-            await kvPut(`domain:${domain}`, { type: deploy ? 'deploy' : 'short', shortCode });
-            await ctx.reply(`✅ Domain ${domain} mapped to ${shortCode}. DNS propagation may take a few minutes.`);
-        } catch(e) { ctx.reply(`❌ Error: ${e.message}`); }
-    } else if (sub === 'del' && args[2]) {
-        const domain = args[2];
-        const mapping = await kvGet(`domain:${domain}`);
-        if (!mapping) return ctx.reply('Domain not found.');
-        await deleteCNAME(domain);
-        await kvPut(`domain:${domain}`, null); // delete
-        await ctx.reply(`✅ Domain ${domain} removed.`);
-    } else if (sub === 'edit' && args[2] && args[3]) {
-        // similar to add/delete
-        await ctx.reply('Feature in progress. Remove and add new.');
-    } else if (sub === 'list') {
-        // For simplicity, we'll just reply that we don't have a listing yet
-        await ctx.reply('To list domains, please use the /domains command (requires additional implementation).');
-    } else {
-        await ctx.reply('Usage:\n/domain add <shortcode> <domain.com>\n/domain del <domain.com>');
-    }
-});
-
+// ==================== COMMAND HANDLERS ====================
 bot.command('stats', async (ctx) => {
     const id = ctx.message.text.split(' ')[1];
     if (!id) return ctx.reply('Usage: /stats <shortcode or apk:id>');
@@ -306,10 +399,9 @@ bot.command('stats', async (ctx) => {
         const data = await kvGet(`apk:${apkId}`);
         if (!data) return ctx.reply('APK not found');
         const downloads = data.downloads || 0;
-        await ctx.reply(`📊 APK *${apkId}*\nDownloads: ${downloads}\nOriginal name: ${data.originalName}\nUploaded: ${data.uploadTime}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`📊 APK *${apkId}*\nDownloads: ${downloads}\nUploaded: ${data.uploadTime}`, { parse_mode: 'Markdown' });
     } else {
-        const viewsKey = `views:${id}`;
-        const views = (await kvGet(viewsKey)) || 0;
+        const views = (await kvGet(`views:${id}`)) || 0;
         const short = await kvGet(`short:${id}`);
         const deploy = await kvGet(`deploy:${id}`);
         if (!short && !deploy) return ctx.reply('Short code not found.');
@@ -318,8 +410,35 @@ bot.command('stats', async (ctx) => {
     }
 });
 
+bot.command('domain', async (ctx) => {
+    const args = ctx.message.text.split(' ');
+    if (args[1] === 'add' && args[2] && args[3]) {
+        const shortCode = args[2];
+        const domain = args[3];
+        const deploy = await kvGet(`deploy:${shortCode}`);
+        const short = await kvGet(`short:${shortCode}`);
+        if (!deploy && !short) return ctx.reply('Short code not found.');
+        const target = deploy ? WORKER_DEPLOY_URL.replace('https://', '') : WORKER_SHORT_URL.replace('https://', '');
+        try {
+            await addCNAME(domain, target);
+            await kvPut(`domain:${domain}`, { type: deploy ? 'deploy' : 'short', shortCode });
+            await ctx.reply(`✅ Domain ${domain} mapped to ${shortCode}.`);
+        } catch(e) { ctx.reply(`❌ Error: ${e.message}`); }
+    } else if (args[1] === 'del' && args[2]) {
+        const domain = args[2];
+        try {
+            await deleteCNAME(domain);
+            await kvDelete(`domain:${domain}`);
+            await ctx.reply(`✅ Domain ${domain} removed.`);
+        } catch(e) { ctx.reply(`❌ Error: ${e.message}`); }
+    } else {
+        await ctx.reply('Usage:\n/domain add <shortcode> <domain.com>\n/domain del <domain.com>');
+    }
+});
+
+// Back to main menu action
 bot.action('start_menu', async (ctx) => {
-    await ctx.reply('🔙 Returning to main menu.', Markup.inlineKeyboard([
+    await ctx.reply('🔙 Main menu', Markup.inlineKeyboard([
         [Markup.button.callback('🔌 Wallet Connect', 'menu_wallet')],
         [Markup.button.callback('🔗 Short URL', 'menu_short')],
         [Markup.button.callback('📦 Deploy Website', 'menu_deploy')],
@@ -329,20 +448,18 @@ bot.action('start_menu', async (ctx) => {
     ]));
 });
 
-// Default fallback
-bot.on('message', (ctx) => {
-    if (!ctx.session?.expecting) {
-        ctx.reply('Please use the main menu buttons.', Markup.inlineKeyboard([Markup.button.callback('🔙 Main menu', 'start_menu')]));
-    }
-});
+// Wallet submenu back (simple)
+function walletKeyboard() {
+    return Markup.inlineKeyboard([Markup.button.callback('🔙 Back', 'start_menu')]);
+}
 
-// ---- Express web server for health checks ----
+// ==================== WEB SERVER FOR RENDER ====================
 const app = express();
 app.get('/', (req, res) => res.send('Bot is alive'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Web server on ${PORT}`));
 
-// Launch bot
 bot.launch().then(() => console.log('Bot started polling'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
