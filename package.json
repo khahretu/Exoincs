@@ -1,7 +1,7 @@
 {
   "name": "exogator-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for wallet connect, short URLs, website deployment, APK hosting, custom domains",
+  "description": "Multi-feature Telegram Bot for Wallet, Short URLs, Deploy, APK, Domains",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -14,7 +14,5 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "author": "Exogator",
-  "license": "MIT"
+  }
 }
