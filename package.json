@@ -1,7 +1,7 @@
 {
   "name": "exogator-bot",
-  "version": "2.0.0",
-  "description": "Telegram bot for URL shortener, website deploy, APK hosting, wallet connect",
+  "version": "3.0.0",
+  "description": "Telegram bot for URL shortener, website deploy, APK hosting, wallet connect with admin features",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
